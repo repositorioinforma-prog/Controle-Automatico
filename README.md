@@ -1,4 +1,4 @@
-# Gerador de Controle Geral — MVP 1
+# Gerador de Controle Geral — MVP 2
 
 Aplicativo em Python/Streamlit para criação e auditoria de variáveis de controle em bancos de pesquisas quantitativas.
 

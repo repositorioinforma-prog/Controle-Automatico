@@ -6,10 +6,14 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from core.geographic_validation import build_geographic_coherence_report
+from core.duplicates import (
+    DATE_LABEL_PATTERNS, DuplicateConfig, NAME_LABEL_PATTERNS, PHONE_LABEL_PATTERNS,
+    find_column_by_label, find_duplicates,
+)
+from core.geographic_validation import build_geographic_coherence_report, build_cidade_bairro_realocation
 from core.recoding import ControlVariableConfig, recode_dataframe
 from core.value_labels import parse_all_value_labels_sps
-from exporters.sps import make_value_labels_syntax
+from exporters.sps import make_exclusion_syntax, make_value_labels_syntax
 from exporters.sav import write_sav_bytes
 from geography.database import load_geography_excel, UF_OPTIONS, uf_option_to_sigla
 from importers.sav import read_sav_bytes, variable_catalog
@@ -25,7 +29,7 @@ st.caption("MVP 2.1 — Base Brasil, recodificação geográfica e coerência Ci
 # os resultados derivados, preservando os arquivos/configurações que ainda forem válidos.
 SESSION_SCHEMA_VERSION = 2
 if st.session_state.get("session_schema_version") != SESSION_SCHEMA_VERSION:
-    for key in ["audit_df", "output_df", "generated_label_sets", "coherence_df"]:
+    for key in ["audit_df", "output_df", "generated_label_sets", "coherence_df", "realocacao_df"]:
         st.session_state.pop(key, None)
     st.session_state.session_schema_version = SESSION_SCHEMA_VERSION
 
@@ -70,8 +74,9 @@ def _load_internal_geography():
     return None
 
 
-step1, step2, step3, step4, step5 = st.tabs([
-    "1. Importação", "2. Configuração", "3. Processamento", "4. Revisão", "5. Resultados / Exportação"
+step1, step2, step3, step4, step5, step6 = st.tabs([
+    "1. Importação", "2. Configuração", "3. Processamento", "4. Revisão", "5. Resultados / Exportação",
+    "6. Duplicidades",
 ])
 
 with step1:
@@ -86,7 +91,19 @@ with step1:
     internal_geo = _load_internal_geography()
     if internal_geo is not None:
         st.session_state.geography_db = internal_geo
-        st.success(f"Base Brasil interna carregada: {internal_geo.source_name}")
+        st.success(f"Base Brasil interna carregada: {internal_geo.source_name} — não precisa enviar de novo.")
+        with st.expander("Usar outra planilha só desta vez (opcional)"):
+            geo_file_override = st.file_uploader(
+                "Base Brasil alternativa (.xlsx/.xls)", type=["xlsx", "xls"], key="geo_override"
+            )
+            if geo_file_override:
+                try:
+                    st.session_state.geography_db = _cached_geography_from_bytes(
+                        geo_file_override.getvalue(), geo_file_override.name
+                    )
+                    st.info("Usando a planilha enviada nesta sessão, no lugar da base interna.")
+                except Exception as exc:
+                    st.error(f"Não foi possível ler a Base Brasil enviada: {exc}")
     else:
         st.info(
             "A Base Brasil ainda não está embutida nesta cópia do projeto. Envie a planilha abaixo. "
@@ -250,7 +267,7 @@ with step2:
         ]), hide_index=True, use_container_width=True)
         if st.button("Limpar configuração"):
             st.session_state.control_configs = []
-            for key in ["audit_df", "output_df", "generated_label_sets", "coherence_df"]:
+            for key in ["audit_df", "output_df", "generated_label_sets", "coherence_df", "realocacao_df"]:
                 st.session_state.pop(key, None)
             st.rerun()
 
@@ -291,6 +308,7 @@ with step3:
         st.session_state.output_df = output_df
         st.session_state.generated_label_sets = generated_label_sets
         st.session_state.coherence_df = coherence_df
+        st.session_state.pop("realocacao_df", None)
 
         st.success("Processamento concluído.")
         counts = audit_df["status"].value_counts()
@@ -389,6 +407,84 @@ with step4:
             st.markdown("#### Cidade × Bairro/Distrito")
             st.dataframe(coherence, hide_index=True, use_container_width=True)
 
+        st.divider()
+        st.markdown("#### Verificação cruzada Cidade × Bairro (realocação)")
+        st.caption(
+            "Confere as duas pontas: (1) o bairro respondido pertence, na Base Brasil, a outro município "
+            "da amostra; (2) o que foi escrito no campo de Bairro é, na verdade, o nome de outra cidade "
+            "(mesmo que outra cidade tenha sido marcada na pergunta de Cidade). Só sugere quando o município "
+            "alternativo está nos VALUE LABELS válidos do projeto — nunca aplica sozinho."
+        )
+        configs = st.session_state.control_configs
+        municipal_cfgs = [c for c in configs if c.get("geographic_type") == "municipio"]
+        child_cfgs = [c for c in configs if c.get("geographic_type") in {"bairro", "distrito"}]
+        if not municipal_cfgs or not child_cfgs:
+            st.info("Configure uma variável de Município e uma de Bairro/Distrito na Etapa 2 para usar esta verificação.")
+        else:
+            city_cfg = municipal_cfgs[0]
+            if len(child_cfgs) == 1:
+                child_cfg_choice = child_cfgs[0]
+            else:
+                child_cfg_choice = st.selectbox(
+                    "Variável de Bairro/Distrito a usar na verificação",
+                    child_cfgs, format_func=lambda c: c["output_name"], key="realoc_child_cfg",
+                )
+            if st.button("Verificar realocações Cidade × Bairro"):
+                with st.spinner("Cruzando as duas respostas..."):
+                    geography_db_atual = st.session_state.get("geography_db")
+                    ufs = st.session_state.get("ufs_pesquisa") or None
+                    if geography_db_atual is not None and ufs:
+                        geography_db_atual = geography_db_atual.filter_by_uf(ufs)
+                    bank_value_labels_atual = getattr(meta, "variable_value_labels", {}) or {}
+                    st.session_state.realocacao_df = build_cidade_bairro_realocation(
+                        df, st.session_state.audit_df, city_cfg, child_cfg_choice,
+                        label_sets, bank_value_labels_atual, geography_db_atual,
+                        st.session_state.id_column,
+                    )
+
+            realoc_df = st.session_state.get("realocacao_df")
+            if realoc_df is not None:
+                if realoc_df.empty:
+                    st.success("Nenhuma realocação sugerida com os dados atuais.")
+                else:
+                    aplicaveis = realoc_df[realoc_df["status"] == "INCONSISTENTE"]
+                    ambiguos = realoc_df[realoc_df["status"] == "AMBÍGUO"]
+                    if not aplicaveis.empty:
+                        st.warning(f"{len(aplicaveis)} entrevista(s) com realocação de Cidade sugerida.")
+                        st.dataframe(aplicaveis, hide_index=True, use_container_width=True)
+                    if not ambiguos.empty:
+                        st.info(
+                            f"{len(ambiguos)} caso(s) em que o texto do Bairro bate como bairro de uma cidade "
+                            "E como nome de outra cidade ao mesmo tempo — as duas leituras discordam, então "
+                            "não sugerimos sozinho. Revise manualmente:"
+                        )
+                        st.dataframe(ambiguos, hide_index=True, use_container_width=True)
+                    if not aplicaveis.empty and st.button("Aplicar realocações à variável de Cidade", type="primary"):
+                        output_df = st.session_state.output_df
+                        audit_df_atualizado = st.session_state.audit_df.copy()
+                        city_var = city_cfg["output_name"]
+                        if city_var not in output_df.columns:
+                            st.error(f"A variável '{city_var}' não existe no banco processado.")
+                        else:
+                            id_series = df[st.session_state.id_column].astype(str)
+                            realoc_ids = aplicaveis["ID"].astype(str)
+                            code_by_id = dict(zip(realoc_ids, pd.to_numeric(aplicaveis["codigo_cidade_sugerido"])))
+                            label_by_id = dict(zip(realoc_ids, aplicaveis["municipio_base"]))
+                            mask = id_series.isin(realoc_ids)
+                            output_df.loc[mask, city_var] = id_series[mask].map(code_by_id).astype(float).to_numpy()
+
+                            audit_ids = audit_df_atualizado["ID"].astype(str)
+                            row_mask = (audit_df_atualizado["variavel_controle"] == city_var) & audit_ids.isin(realoc_ids)
+                            audit_df_atualizado.loc[row_mask, "status"] = "REALOCADO (Cidade × Bairro)"
+                            audit_df_atualizado.loc[row_mask, "codigo_sugerido"] = audit_ids[row_mask].map(code_by_id).to_numpy()
+                            audit_df_atualizado.loc[row_mask, "label_sugerido"] = audit_ids[row_mask].map(label_by_id).to_numpy()
+                            audit_df_atualizado.loc[row_mask, "decisao_automatica"] = True
+
+                            st.session_state.output_df = output_df
+                            st.session_state.audit_df = audit_df_atualizado
+                            st.success(f"{len(aplicaveis)} entrevista(s) realocada(s). Confira o resultado na Etapa 5.")
+                            st.rerun()
+
 with step5:
     st.subheader("Resultados / Exportação")
     if "audit_df" not in st.session_state:
@@ -474,3 +570,118 @@ with step5:
             "Casos não automáticos permanecem vazios no banco provisório. A auditoria preserva a resposta, "
             "a interpretação da Base Brasil, a validade na amostra e o motivo da pendência."
         )
+
+with step6:
+    st.subheader("Duplicidades")
+    if True:
+        st.caption(
+            "Detecta entrevistas duplicadas por nome + telefone. As variáveis são achadas automaticamente "
+            "pelo LABEL delas no banco (ex.: label 'Nome', label 'Tel.') — confira/ajuste se necessário."
+        )
+        column_labels = getattr(meta, "column_names_to_labels", {}) or {}
+        auto_name = find_column_by_label(column_labels, NAME_LABEL_PATTERNS)
+        auto_phone = find_column_by_label(column_labels, PHONE_LABEL_PATTERNS)
+        auto_date = find_column_by_label(column_labels, DATE_LABEL_PATTERNS, also_check_names=True)
+
+        columns = list(df.columns)
+        none_option = "(nenhuma)"
+        options = [none_option] + columns
+
+        def _label_of(col):
+            if col == none_option:
+                return col
+            lbl = column_labels.get(col, "")
+            return f"{col} — {lbl}" if lbl else col
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            name_col = st.selectbox(
+                "Variável de Nome", options,
+                index=options.index(auto_name) if auto_name in options else 0,
+                format_func=_label_of, key="dup_name_col",
+            )
+        with col2:
+            phone_col = st.selectbox(
+                "Variável de Telefone", options,
+                index=options.index(auto_phone) if auto_phone in options else 0,
+                format_func=_label_of, key="dup_phone_col",
+            )
+        with col3:
+            date_col = st.selectbox(
+                "Variável de Data (para saber qual é a mais antiga)", options,
+                index=options.index(auto_date) if auto_date in options else 0,
+                format_func=_label_of, key="dup_date_col",
+            )
+
+        if name_col == none_option and phone_col == none_option:
+            st.warning("Selecione ao menos Nome ou Telefone para poder buscar duplicidades.")
+        else:
+            if st.button("Analisar duplicidades", type="primary"):
+                with st.spinner("Comparando nomes e telefones..."):
+                    dup_config = DuplicateConfig(
+                        id_column=st.session_state.id_column,
+                        name_column=None if name_col == none_option else name_col,
+                        phone_column=None if phone_col == none_option else phone_col,
+                        date_column=None if date_col == none_option else date_col,
+                    )
+                    st.session_state.duplicates_df = find_duplicates(df, dup_config)
+                    st.session_state.duplicates_id_column = dup_config.id_column
+
+        if "duplicates_df" in st.session_state:
+            dup_df = st.session_state.duplicates_df
+            if dup_df.empty:
+                st.success("Nenhuma duplicidade encontrada com os critérios atuais.")
+            else:
+                tipo_filter = st.multiselect(
+                    "Filtrar por tipo de duplicidade",
+                    ["certa", "provavel"],
+                    default=["certa", "provavel"],
+                    format_func=lambda t: {
+                        "certa": "Certa (mesmo telefone)",
+                        "provavel": "Provável (mesmo nome + telefone parecido)",
+                    }[t],
+                )
+                dup_df_filtrado = dup_df[dup_df["tipo_duplicidade"].isin(tipo_filter)]
+
+                n_grupos = dup_df_filtrado["grupo"].nunique()
+                n_excluir = int((dup_df_filtrado["recomendacao"] == "excluir").sum())
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Grupos de duplicidade", n_grupos)
+                c2.metric("Entrevistas envolvidas", len(dup_df_filtrado))
+                c3.metric("Recomendadas para exclusão", n_excluir)
+
+                st.dataframe(dup_df_filtrado, hide_index=True, use_container_width=True)
+                st.caption(
+                    "Nenhuma entrevista é excluída automaticamente do banco — isso só acontece se você "
+                    "aplicar a sintaxe .sps abaixo no seu banco no SPSS. Os arquivos abaixo seguem o "
+                    "filtro de tipo de duplicidade selecionado acima."
+                )
+
+                ids_excluir = dup_df_filtrado.loc[dup_df_filtrado["recomendacao"] == "excluir", "ID"].tolist()
+                st.divider()
+                st.markdown("#### Exportar exclusões")
+
+                txt_content = "\n".join(ids_excluir)
+                st.download_button(
+                    "Baixar códigos a excluir (.txt)",
+                    txt_content.encode("utf-8-sig"),
+                    "entrevistas_duplicadas_excluir.txt",
+                    "text/plain",
+                    disabled=not ids_excluir,
+                )
+
+                id_col_name = st.session_state.duplicates_id_column
+                id_is_string = not pd.api.types.is_numeric_dtype(df[id_col_name])
+                syntax = make_exclusion_syntax(
+                    id_col_name, ids_excluir, id_is_string,
+                    comment="Mantida a entrevista mais antiga de cada grupo; demais marcadas para exclusão.",
+                )
+                st.download_button(
+                    "Baixar sintaxe SPSS para excluir os duplicados (.sps)",
+                    syntax.encode("utf-8-sig"),
+                    "excluir_duplicidades.sps",
+                    "text/plain",
+                    disabled=not ids_excluir,
+                )
+                with st.expander("Ver sintaxe gerada"):
+                    st.code(syntax, language="sql")
