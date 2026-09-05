@@ -3,6 +3,7 @@ import pandas as pd
 from .matching import confidence_status, match_text
 from .normalization import is_generic_other_label, normalize_text
 from geography.resolver import resolve_to_target
+from geography.hierarquia_bairros import get_hierarchy
 
 
 @dataclass(frozen=True)
@@ -46,14 +47,6 @@ def choose_source_text(row, source_columns, bank_value_labels):
         if text:
             return text, column, attempts
     return "", None, attempts
-
-
-def _project_exact(value: str, project_labels: dict):
-    key = normalize_text(value)
-    matches = [(code, label) for code, label in project_labels.items() if normalize_text(label) == key]
-    if len(matches) == 1:
-        return matches[0]
-    return None
 
 
 def _recode_geographic_row(row, config, project_labels, bank_value_labels, id_column, geography_db):
@@ -165,8 +158,33 @@ def _recode_geographic_row(row, config, project_labels, bank_value_labels, id_co
             "fontes_consultadas": " | ".join(f"{c}={raw!s} -> {txt}" for c, raw, txt in attempts),
         }
 
-    project_match = _project_exact(resolution.value, project_labels)
-    if project_match is None:
+    project_result = match_text(resolution.value, project_labels, config.fuzzy_cutoff)
+    if project_result.code is None:
+        # Antes de aceitar "fora da amostra", verifica se o texto é um
+        # loteamento que fica DE VERDADE dentro de um bairro oficial que tem
+        # um representante aprovado nos VALUE LABELS — isso é uma correção
+        # legítima (mesmo lugar, nome popular diferente), bem diferente de
+        # realocar para outro bairro por estar "perto"/na mesma região, o que
+        # o motor nunca faz sozinho.
+        if config.geographic_type == "bairro" and resolution.municipality:
+            hierarchy = get_hierarchy(resolution.municipality)
+            if hierarchy:
+                found = hierarchy.find(resolution.value) or hierarchy.find(text)
+                if found:
+                    representative = hierarchy.approved_representative(found.bairro_oficial, project_labels)
+                    if representative:
+                        rep_code, rep_label = representative
+                        return {
+                            "ID": row.get(id_column), "variavel_controle": config.output_name,
+                            "tipo_geografico": config.geographic_type, "texto_interpretado": text,
+                            "fonte_utilizada": source, "codigo_sugerido": rep_code, "label_sugerido": rep_label,
+                            "metodo": f"hierarquia_bairro_oficial:{found.metodo}", "confianca": round(resolution.score, 4),
+                            "status": "AJUSTADO AUTOMATICAMENTE", "decisao_automatica": True,
+                            "candidatos": "", "localidade_base": resolution.matched_name or text,
+                            "tipo_localidade_base": resolution.matched_type or "",
+                            "municipio_base": resolution.municipality, "uf_base": resolution.uf,
+                            "fontes_consultadas": " | ".join(f"{c}={raw!s} -> {txt}" for c, raw, txt in attempts),
+                        }
         return {
             "ID": row.get(id_column), "variavel_controle": config.output_name,
             "tipo_geografico": config.geographic_type, "texto_interpretado": text,
@@ -179,16 +197,28 @@ def _recode_geographic_row(row, config, project_labels, bank_value_labels, id_co
             "fontes_consultadas": " | ".join(f"{c}={raw!s} -> {txt}" for c, raw, txt in attempts),
         }
 
-    code, label = project_match
-    automatic = resolution.method in {"geografica_exata", "geografica_exata_sufixo_uf"}
-    status = "CONFIRMADO" if automatic and normalize_text(text) == normalize_text(label) else (
-        "AJUSTADO AUTOMATICAMENTE" if automatic else "SUGESTÃO"
-    )
+    code, label = project_result.code, project_result.label
+    # Precisa de confiança nos DOIS lados: a resposta bateu com segurança contra
+    # a Base Brasil E o nome identificado bateu com segurança contra os VALUE
+    # LABELS do projeto. O nome "oficial" de um bairro na Base Brasil às vezes
+    # não tem o mesmo prefixo popular que o projeto usa (ex.: Base Brasil chama
+    # de "Sobrinho", o projeto usa "Vila Sobrinho") — por isso o segundo lado
+    # também usa correspondência por substring/fuzzy, não só igualdade exata.
+    geo_automatic = resolution.method in {"geografica_exata", "geografica_exata_sufixo_uf"}
+    project_status = confidence_status(project_result, config.auto_fuzzy_threshold)
+    project_automatic = project_status in {"CONFIRMADO", "AJUSTADO AUTOMATICAMENTE"}
+    automatic = geo_automatic and project_automatic
+    if automatic and normalize_text(text) == normalize_text(label):
+        status = "CONFIRMADO"
+    elif automatic:
+        status = "AJUSTADO AUTOMATICAMENTE"
+    else:
+        status = "SUGESTÃO"
     return {
         "ID": row.get(id_column), "variavel_controle": config.output_name,
         "tipo_geografico": config.geographic_type, "texto_interpretado": text,
         "fonte_utilizada": source, "codigo_sugerido": code, "label_sugerido": label,
-        "metodo": resolution.method, "confianca": round(resolution.score, 4), "status": status,
+        "metodo": f"{resolution.method}+{project_result.method}", "confianca": round(min(resolution.score, project_result.score), 4), "status": status,
         "decisao_automatica": automatic, "candidatos": ", ".join(resolution.candidates),
         "localidade_base": resolution.matched_name or text, "tipo_localidade_base": resolution.matched_type or "",
         "municipio_base": resolution.municipality or (resolution.value if config.geographic_type == "municipio" else ""),

@@ -11,11 +11,13 @@ from core.duplicates import (
     find_column_by_label, find_duplicates,
 )
 from core.geographic_validation import build_geographic_coherence_report, build_cidade_bairro_realocation
+from core.history_learning import build_text_to_code_lookup, apply_learned_lookup
 from core.recoding import ControlVariableConfig, recode_dataframe
-from core.value_labels import parse_all_value_labels_sps
+from core.value_labels import parse_all_value_labels_sps, decode_sps_bytes
 from exporters.sps import make_exclusion_syntax, make_value_labels_syntax
 from exporters.sav import write_sav_bytes
 from geography.database import load_geography_excel, UF_OPTIONS, uf_option_to_sigla
+from geography.hierarquia_bairros import get_hierarchy
 from importers.sav import read_sav_bytes, variable_catalog
 
 
@@ -87,6 +89,30 @@ with step1:
     with col2:
         sps_file = st.file_uploader("VALUE LABELS do projeto (.sps)", type=["sps"], key="sps")
 
+    with st.expander("Aprendizado com banco anterior (opcional)"):
+        st.caption(
+            "Em pesquisas de acompanhamento contínuo (tracking), o mesmo apelido, erro de digitação ou "
+            "nome popular de bairro tende a se repetir de um dia para o outro. Se você já tem um banco de "
+            "uma onda anterior com essas mesmas variáveis já codificadas, o app pode reaproveitar essas "
+            "decisões para os casos que a Base Brasil sozinha não resolve hoje — só complementa o que "
+            "ficaria pendente, nunca substitui uma decisão já confirmada nesta rodada."
+        )
+        historical_file = st.file_uploader(
+            "Banco anterior já codificado (.sav)", type=["sav"], key="historical_sav"
+        )
+        if historical_file:
+            with st.spinner("Lendo banco anterior..."):
+                hist_df, hist_meta = _cached_read_sav(historical_file.getvalue())
+            st.session_state.historical_df = hist_df
+            st.session_state.historical_meta = hist_meta
+            st.success(f"Banco anterior carregado: {len(hist_df):,} entrevistas, {len(hist_df.columns)} variáveis.")
+        elif "historical_df" in st.session_state:
+            st.info(f"Usando banco anterior já carregado ({len(st.session_state.historical_df):,} entrevistas).")
+            if st.button("Remover banco anterior"):
+                for key in ["historical_df", "historical_meta", "historical_code_columns"]:
+                    st.session_state.pop(key, None)
+                st.rerun()
+
     st.subheader("Base geográfica do Brasil")
     internal_geo = _load_internal_geography()
     if internal_geo is not None:
@@ -137,11 +163,12 @@ with step1:
         with st.spinner("Lendo banco e VALUE LABELS..."):
             df, meta = _cached_read_sav(sav_file.getvalue())
             label_sets = _cached_parse_sps(
-                sps_file.getvalue().decode("utf-8-sig", errors="replace")
+                decode_sps_bytes(sps_file.getvalue())
             )
         st.session_state.df = df
         st.session_state.meta = meta
         st.session_state.label_sets = label_sets
+        st.session_state.sav_original_filename = sav_file.name
         st.success(f"Banco carregado: {len(df):,} entrevistas e {len(df.columns)} variáveis.")
         st.success(f"Syntax carregada: {len(label_sets)} conjunto(s) de VALUE LABELS encontrado(s).")
         st.dataframe(pd.DataFrame(variable_catalog(df, meta)), hide_index=True, use_container_width=True)
@@ -271,6 +298,24 @@ with step2:
                 st.session_state.pop(key, None)
             st.rerun()
 
+        if "historical_df" in st.session_state:
+            st.markdown("##### De onde vem o código já pronto no banco anterior")
+            hist_columns = list(st.session_state.historical_df.columns)
+            mapping = st.session_state.get("historical_code_columns", {})
+            for c in st.session_state.control_configs:
+                name = c["output_name"]
+                default_col = name if name in hist_columns else (
+                    c["label_set_name"] if c["label_set_name"] in hist_columns else hist_columns[0]
+                )
+                chosen = st.selectbox(
+                    f"Coluna no banco anterior com o código já pronto de '{name}'",
+                    hist_columns,
+                    index=hist_columns.index(mapping.get(name, default_col)) if mapping.get(name, default_col) in hist_columns else 0,
+                    key=f"hist_map_{name}",
+                )
+                mapping[name] = chosen
+            st.session_state.historical_code_columns = mapping
+
 with step3:
     st.subheader("Processamento")
     if not st.session_state.control_configs:
@@ -286,6 +331,11 @@ with step3:
             geography_db = geography_db.filter_by_uf(ufs_pesquisa)
 
         with st.spinner("Interpretando respostas e verificando a Base Brasil..."):
+            historical_df = st.session_state.get("historical_df")
+            historical_meta = st.session_state.get("historical_meta")
+            historical_mapping = st.session_state.get("historical_code_columns", {})
+            historical_value_labels = getattr(historical_meta, "variable_value_labels", {}) or {} if historical_meta else {}
+
             for raw in st.session_state.control_configs:
                 config = ControlVariableConfig(**raw)
                 labels = label_sets[config.label_set_name]
@@ -293,6 +343,16 @@ with step3:
                     df, config, labels, bank_value_labels, st.session_state.id_column,
                     geography_db=geography_db,
                 )
+
+                code_column = historical_mapping.get(config.output_name)
+                if historical_df is not None and code_column:
+                    hierarchy_for_learning = get_hierarchy("Campo Grande") if config.geographic_type == "bairro" else None
+                    lookup, _conflicts = build_text_to_code_lookup(
+                        historical_df, config.source_columns, code_column, historical_value_labels,
+                        hierarchy=hierarchy_for_learning, project_labels=labels,
+                    )
+                    audit = apply_learned_lookup(audit, lookup, labels)
+
                 all_audits.append(audit)
                 codes = pd.Series(pd.NA, index=df.index, dtype="Float64")
                 auto = audit["decisao_automatica"] & audit["codigo_sugerido"].notna()
@@ -313,10 +373,10 @@ with step3:
         st.success("Processamento concluído.")
         counts = audit_df["status"].value_counts()
         statuses = [
-            "CONFIRMADO", "AJUSTADO AUTOMATICAMENTE", "SUGESTÃO", "AMBÍGUO",
+            "CONFIRMADO", "AJUSTADO AUTOMATICAMENTE", "APRENDIDO (banco anterior)", "SUGESTÃO", "AMBÍGUO",
             "FORA DA AMOSTRA", "NÃO IDENTIFICADO",
         ]
-        for col, status in zip(st.columns(6), statuses):
+        for col, status in zip(st.columns(len(statuses)), statuses):
             col.metric(status.title(), int(counts.get(status, 0)))
 
         st.dataframe(audit_df, hide_index=True, use_container_width=True)
@@ -560,10 +620,13 @@ with step5:
                 )
                 st.session_state.sav_bytes = sav_bytes
         if "sav_bytes" in st.session_state:
+            original_name = st.session_state.get("sav_original_filename", "banco.sav")
+            base_name = original_name[:-4] if original_name.lower().endswith(".sav") else original_name
+            output_filename = f"{base_name}_CONTROLADO.sav"
             st.download_button(
                 "Baixar banco controlado (.sav)",
                 st.session_state.sav_bytes,
-                "banco_controlado.sav",
+                output_filename,
                 "application/octet-stream",
             )
         st.caption(
