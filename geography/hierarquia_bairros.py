@@ -9,6 +9,7 @@ implicitamente pelo motor de matching.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from core.normalization import normalize_text
@@ -18,7 +19,7 @@ from core.normalization import normalize_text
 class BairroHierarchyMatch:
     bairro_oficial: str
     regiao: str
-    metodo: str  # 'bairro_oficial_exato' ou 'loteamento_contido'
+    metodo: str  # 'bairro_oficial_exato', 'loteamento_contido' ou 'loteamento_substring'
 
 
 class BairroHierarchy:
@@ -40,10 +41,33 @@ class BairroHierarchy:
         if not key:
             return None
         bairro_oficial = self._index.get(key)
-        if not bairro_oficial:
+        if bairro_oficial:
+            metodo = "bairro_oficial_exato" if normalize_text(bairro_oficial) == key else "loteamento_contido"
+            return BairroHierarchyMatch(bairro_oficial, self.data[bairro_oficial]["regiao"], metodo)
+
+        # Respostas costumam vir abreviadas ("Estrela do Sul") em relação ao
+        # nome completo cadastrado ("Conjunto Residencial Estrela do Sul") —
+        # ou vice-versa. Tenta substring nos dois sentidos antes de desistir,
+        # priorizando o candidato mais longo/específico para reduzir risco de
+        # confundir com um trecho curto e genérico demais.
+        if len(key) < 5:
+            return None  # texto curto demais para arriscar substring com segurança
+        candidates = [
+            k for k in self._index
+            if len(k) >= 5 and (
+                re.search(r"(?<!\w)" + re.escape(k) + r"(?!\w)", key)
+                or re.search(r"(?<!\w)" + re.escape(key) + r"(?!\w)", k)
+            )
+        ]
+        if not candidates:
             return None
-        metodo = "bairro_oficial_exato" if normalize_text(bairro_oficial) == key else "loteamento_contido"
-        return BairroHierarchyMatch(bairro_oficial, self.data[bairro_oficial]["regiao"], metodo)
+        candidates.sort(key=len, reverse=True)
+        best_len = len(candidates[0])
+        top = {self._index[k] for k in candidates if len(k) == best_len}
+        if len(top) != 1:
+            return None  # ambíguo entre bairros oficiais diferentes, não decide sozinho
+        bairro_oficial = next(iter(top))
+        return BairroHierarchyMatch(bairro_oficial, self.data[bairro_oficial]["regiao"], "loteamento_substring")
 
     def approved_representative(self, bairro_oficial: str, project_labels: dict) -> tuple[object, str] | None:
         """Entre os VALUE LABELS aprovados do projeto, encontra qual (se algum)
