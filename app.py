@@ -12,9 +12,10 @@ from core.duplicates import (
 )
 from core.geographic_validation import build_geographic_coherence_report, build_cidade_bairro_realocation
 from core.history_learning import build_text_to_code_lookup, apply_learned_lookup
+from core.electoral_validation import detect_nao_vota_codes, validate_electoral
 from core.recoding import ControlVariableConfig, recode_dataframe
 from core.value_labels import parse_all_value_labels_sps, decode_sps_bytes
-from exporters.sps import make_exclusion_syntax, make_value_labels_syntax
+from exporters.sps import make_exclusion_syntax, make_exclusion_syntax_with_reasons, make_value_labels_syntax
 from exporters.sav import write_sav_bytes
 from geography.database import load_geography_excel, UF_OPTIONS, uf_option_to_sigla
 from geography.hierarquia_bairros import get_hierarchy
@@ -76,9 +77,9 @@ def _load_internal_geography():
     return None
 
 
-step1, step2, step3, step4, step5, step6 = st.tabs([
+step1, step2, step3, step4, step5, step6, step7, step8 = st.tabs([
     "1. Importação", "2. Configuração", "3. Processamento", "4. Revisão", "5. Resultados / Exportação",
-    "6. Duplicidades",
+    "6. Duplicidades", "7. Validação Eleitoral", "8. Exclusões Consolidadas",
 ])
 
 with step1:
@@ -748,3 +749,188 @@ with step6:
                 )
                 with st.expander("Ver sintaxe gerada"):
                     st.code(syntax, language="sql")
+
+with step7:
+    st.subheader("Validação Eleitoral")
+    st.caption(
+        "Verifica se cada entrevistado vota dentro do(s) estado(s) da pesquisa, em outro estado, ou "
+        "declarou que não vota / não vota mais. Usa a Base Brasil (nacional, não restrita ao estado da "
+        "pesquisa) para descobrir em qual UF fica o local de votação respondido."
+    )
+    if "df" not in st.session_state:
+        st.info("Importe um banco na Etapa 1 primeiro.")
+    else:
+        ufs_pesquisa = st.session_state.get("ufs_pesquisa") or []
+        if ufs_pesquisa:
+            st.write(f"Estado(s) da pesquisa (definido na Etapa 2): **{', '.join(ufs_pesquisa)}**")
+            ufs_eleitoral = ufs_pesquisa
+        else:
+            st.warning(
+                "A Etapa 2 está configurada para 'Brasil inteiro', então não há um estado padrão da "
+                "pesquisa. Escolha abaixo qual(is) estado(s) conta(m) como 'dentro da pesquisa' para "
+                "esta checagem."
+            )
+            ufs_escolhidas = st.multiselect(
+                "Estado(s) considerado(s) 'dentro da pesquisa' para esta checagem", UF_OPTIONS,
+                key="ufs_eleitoral_manual",
+            )
+            ufs_eleitoral = [uf_option_to_sigla(o) for o in ufs_escolhidas]
+
+        columns = list(df.columns)
+        col_labels = getattr(meta, "column_names_to_labels", {}) or {}
+        format_col = lambda c: f"{c} — {col_labels.get(c, '')}" if col_labels.get(c) else c
+
+        var_principal = st.selectbox(
+            "Variável principal (onde vota)", columns,
+            format_func=format_col, key="eleitoral_var_principal",
+        )
+        var_outro = st.selectbox(
+            "Variável 'Outros' (texto livre), se houver", ["(nenhuma)"] + columns,
+            format_func=lambda c: c if c == "(nenhuma)" else format_col(c), key="eleitoral_var_outro",
+        )
+        source_columns = tuple([var_principal] + ([var_outro] if var_outro != "(nenhuma)" else []))
+
+        bank_value_labels_local = getattr(meta, "variable_value_labels", {}) or {}
+        var_principal_labels = bank_value_labels_local.get(var_principal, {})
+        sugeridos = detect_nao_vota_codes(var_principal_labels)
+        if var_principal_labels:
+            nao_vota_escolhidos = st.multiselect(
+                "Códigos que significam 'não vota' / 'não vota mais' (sugestão automática já marcada)",
+                list(var_principal_labels.keys()),
+                default=sugeridos,
+                format_func=lambda c: f"{c} — {var_principal_labels.get(c, '')}",
+                key="eleitoral_nao_vota_codes",
+            )
+        else:
+            st.caption("Essa variável não tem VALUE LABELS no banco — nenhum código de 'não vota' sugerido.")
+            nao_vota_escolhidos = []
+
+        if st.button("Verificar validação eleitoral", disabled=not ufs_eleitoral):
+            with st.spinner("Verificando local de votação..."):
+                geo_nacional = st.session_state.get("geography_db")
+                if geo_nacional is not None:
+                    result = validate_electoral(
+                        df, st.session_state.id_column, source_columns,
+                        set(nao_vota_escolhidos), bank_value_labels_local, geo_nacional,
+                        set(ufs_eleitoral),
+                    )
+                    st.session_state.eleitoral_df = result
+                else:
+                    st.error("Base Brasil não carregada — volte à Etapa 1.")
+        if not ufs_eleitoral:
+            st.caption("Escolha ao menos um estado acima para habilitar a checagem.")
+
+        eleitoral_df = st.session_state.get("eleitoral_df")
+        if eleitoral_df is not None and not eleitoral_df.empty:
+            counts = eleitoral_df["status"].value_counts()
+            cols = st.columns(len(counts))
+            for col, (status, n) in zip(cols, counts.items()):
+                col.metric(status, int(n))
+
+            st.dataframe(eleitoral_df, hide_index=True, use_container_width=True)
+
+            fora = eleitoral_df[eleitoral_df["status"] == "VOTA EM OUTRO ESTADO"]
+            if not fora.empty:
+                st.divider()
+                st.markdown("#### Entrevistados que votam fora do estado da pesquisa")
+                st.dataframe(
+                    fora[["ID", "texto_interpretado", "uf_identificada", "municipio_identificado"]],
+                    hide_index=True, use_container_width=True,
+                )
+                txt_content = "\n".join(fora["ID"].astype(str))
+                st.download_button(
+                    "Baixar IDs que votam fora do estado (.txt)",
+                    txt_content.encode("utf-8-sig"),
+                    "vota_fora_do_estado.txt",
+                    "text/plain",
+                )
+
+with step8:
+    st.subheader("Exclusões Consolidadas")
+    st.caption(
+        "Junta os candidatos a exclusão das Etapas 6 (Duplicidades) e 7 (Validação Eleitoral) num único "
+        "arquivo, com o motivo de cada ID documentado — pra não precisar mandar dois arquivos separados "
+        "pra aprovação. Rode as duas análises antes (o que não rodar simplesmente não aparece aqui)."
+    )
+    dup_df = st.session_state.get("duplicates_df")
+    ele_df = st.session_state.get("eleitoral_df")
+    tem_dup = dup_df is not None and not dup_df.empty
+    tem_ele = ele_df is not None and not ele_df.empty
+
+    if not tem_dup and not tem_ele:
+        st.info("Rode a análise de Duplicidades (Etapa 6) e/ou Validação Eleitoral (Etapa 7) primeiro.")
+    else:
+        pieces = []
+        st.markdown("#### Escolha o que entra na exclusão")
+
+        if tem_dup:
+            certa = dup_df[(dup_df["tipo_duplicidade"] == "certa") & (dup_df["recomendacao"] == "excluir")]
+            provavel = dup_df[(dup_df["tipo_duplicidade"] == "provavel") & (dup_df["recomendacao"] == "excluir")]
+            inc_certa = st.checkbox(f"Duplicidade certa — mesmo telefone ({len(certa)})", value=True, key="cons_dup_certa")
+            inc_provavel = st.checkbox(
+                f"Duplicidade provável — mesmo nome + telefone parecido ({len(provavel)})",
+                value=False, key="cons_dup_prov",
+            )
+            if inc_certa:
+                for _, r in certa.iterrows():
+                    pieces.append({"ID": str(r["ID"]), "motivo": f"Duplicidade certa — {r['motivo']}"})
+            if inc_provavel:
+                for _, r in provavel.iterrows():
+                    pieces.append({"ID": str(r["ID"]), "motivo": f"Duplicidade provável — {r['motivo']}"})
+        else:
+            st.caption("Duplicidades: nenhuma análise rodada ainda na Etapa 6.")
+
+        if tem_ele:
+            fora = ele_df[ele_df["status"] == "VOTA EM OUTRO ESTADO"]
+            nao_vota = ele_df[ele_df["status"] == "NÃO VOTA"]
+            inc_fora = st.checkbox(f"Vota em outro estado ({len(fora)})", value=True, key="cons_ele_fora")
+            inc_naovota = st.checkbox(
+                f"Não vota / não vota mais ({len(nao_vota)})", value=False, key="cons_ele_naovota",
+            )
+            if inc_fora:
+                for _, r in fora.iterrows():
+                    pieces.append({
+                        "ID": str(r["ID"]),
+                        "motivo": f"Vota em outro estado ({r['uf_identificada']}) — {r['texto_interpretado']}",
+                    })
+            if inc_naovota:
+                for _, r in nao_vota.iterrows():
+                    pieces.append({"ID": str(r["ID"]), "motivo": f"Não vota — {r['texto_interpretado']}"})
+        else:
+            st.caption("Validação Eleitoral: nenhuma análise rodada ainda na Etapa 7.")
+
+        if not pieces:
+            st.info("Nenhuma categoria selecionada acima.")
+        else:
+            consolidated = pd.DataFrame(pieces)
+            grouped = consolidated.groupby("ID")["motivo"].apply(lambda s: " | ".join(s)).reset_index()
+            grouped = grouped.sort_values("ID")
+
+            st.divider()
+            st.write(f"**{len(grouped)}** entrevista(s) única(s) selecionada(s) para exclusão.")
+            st.dataframe(grouped, hide_index=True, use_container_width=True)
+
+            txt_content = "\n".join(grouped["ID"])
+            st.download_button(
+                "Baixar IDs consolidados (.txt)",
+                txt_content.encode("utf-8-sig"),
+                "exclusoes_consolidadas.txt",
+                "text/plain",
+            )
+
+            id_col_name = st.session_state.id_column
+            id_is_string = not pd.api.types.is_numeric_dtype(df[id_col_name])
+            id_reason_pairs = list(zip(grouped["ID"], grouped["motivo"]))
+            syntax = make_exclusion_syntax_with_reasons(
+                id_col_name, id_reason_pairs, id_is_string,
+                titulo="Exclusões consolidadas — Duplicidades + Validação Eleitoral",
+            )
+            st.download_button(
+                "Baixar sintaxe SPSS consolidada (.sps)",
+                syntax.encode("utf-8-sig"),
+                "exclusoes_consolidadas.sps",
+                "text/plain",
+            )
+            with st.expander("Ver sintaxe gerada"):
+                st.code(syntax, language="sql")
+

@@ -3,7 +3,7 @@ import pandas as pd
 from .matching import confidence_status, match_text
 from .normalization import is_generic_other_label, normalize_text
 from geography.resolver import resolve_to_target
-from geography.hierarquia_bairros import get_hierarchy
+from geography.hierarquia_bairros import get_hierarchy, find_in_any_hierarchy
 
 
 @dataclass(frozen=True)
@@ -66,6 +66,32 @@ def _recode_geographic_row(row, config, project_labels, bank_value_labels, id_co
 
     if not usable:
         fontes_consultadas = " | ".join(f"{c}={raw!s} -> {txt}" for c, raw, txt in attempts)
+
+        # Antes de qualquer outra tentativa: se é uma variável de bairro e a
+        # Base Brasil nem sequer encontrou o texto como bairro (comum para
+        # loteamentos pequenos/populares que a base nacional não tem), ainda
+        # assim pode ser um loteamento conhecido de uma hierarquia municipal
+        # cadastrada (ex.: Campo Grande) — checa isso antes de desistir.
+        if config.geographic_type == "bairro":
+            for column, raw, text in attempts:
+                if not text:
+                    continue
+                found, hierarchy = find_in_any_hierarchy(text)
+                if not found:
+                    continue
+                representative = hierarchy.approved_representative(found.bairro_oficial, project_labels)
+                if representative:
+                    rep_code, rep_label = representative
+                    return {
+                        "ID": row.get(id_column), "variavel_controle": config.output_name,
+                        "tipo_geografico": config.geographic_type, "texto_interpretado": text,
+                        "fonte_utilizada": column, "codigo_sugerido": rep_code, "label_sugerido": rep_label,
+                        "metodo": f"hierarquia_bairro_oficial:{found.metodo}", "confianca": 0.9,
+                        "status": "AJUSTADO AUTOMATICAMENTE", "decisao_automatica": True,
+                        "candidatos": "", "localidade_base": text, "tipo_localidade_base": "loteamento",
+                        "municipio_base": "", "uf_base": "",
+                        "fontes_consultadas": fontes_consultadas,
+                    }
 
         # A Base Brasil pode não conter o texto exatamente como respondido (ex.:
         # uma resposta de lista fechada como "CAPITAL/Rio de Janeiro"). Antes de

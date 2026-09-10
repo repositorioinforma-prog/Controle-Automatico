@@ -99,6 +99,20 @@ def get_hierarchy(municipio: str) -> BairroHierarchy | None:
     return BairroHierarchy(data) if data else None
 
 
+def find_in_any_hierarchy(text: str) -> tuple[BairroHierarchyMatch | None, BairroHierarchy | None]:
+    """Quando ainda não se sabe (ou não foi possível confirmar) a qual
+    município o texto pertence, tenta contra todas as hierarquias
+    cadastradas. Só existe risco de colisão entre nomes de loteamento de
+    cidades diferentes se duas cidades cadastradas tiverem o MESMO nome de
+    loteamento — hoje, com só Campo Grande cadastrada, isso não ocorre."""
+    for key, data in KNOWN_HIERARCHIES.items():
+        hierarchy = BairroHierarchy(data)
+        found = hierarchy.find(text)
+        if found:
+            return found, hierarchy
+    return None, None
+
+
 from .campo_grande_bairros import CAMPO_GRANDE_MS  # noqa: E402
 
 register_hierarchy("Campo Grande", CAMPO_GRANDE_MS)

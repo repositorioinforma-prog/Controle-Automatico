@@ -47,3 +47,42 @@ def make_exclusion_syntax(id_variable: str, ids_to_exclude: list[str], id_is_str
     lines.append(").")
     lines.append("EXECUTE.")
     return "\n".join(lines)
+
+
+def make_exclusion_syntax_with_reasons(
+    id_variable: str, id_reason_pairs: list[tuple[str, str]], id_is_string: bool,
+    titulo: str = "Exclusões consolidadas",
+) -> str:
+    """Como make_exclusion_syntax, mas com o motivo de cada ID documentado em
+    um comentário logo acima da condição — útil quando os IDs vêm de mais de
+    um critério (ex.: duplicidade + validação eleitoral) e cada um precisa
+    ficar rastreável na sintaxe."""
+    lines = [
+        f"* {titulo} — gerado pelo Gerador de Controle Geral.",
+        f"* Variável identificadora: {id_variable}",
+        f"* Casos a excluir: {len(id_reason_pairs)}",
+        "*",
+    ]
+    for id_value, motivo in id_reason_pairs:
+        lines.append(f"* {id_value}: {motivo}")
+    lines.append("")
+
+    if not id_reason_pairs:
+        lines.append("* Nenhum caso a excluir — nada para fazer.")
+        return "\n".join(lines)
+
+    def literal(value: str) -> str:
+        if id_is_string:
+            return "'" + str(value).replace("'", "''") + "'"
+        return str(value)
+
+    conditions = [f"{id_variable} <> {literal(v)}" for v, _ in id_reason_pairs]
+    lines.append("SELECT IF (")
+    per_line = 4
+    for i in range(0, len(conditions), per_line):
+        chunk = conditions[i:i + per_line]
+        suffix = " AND" if i + per_line < len(conditions) else ""
+        lines.append("    " + " AND ".join(chunk) + suffix)
+    lines.append(").")
+    lines.append("EXECUTE.")
+    return "\n".join(lines)
