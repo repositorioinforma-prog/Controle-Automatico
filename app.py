@@ -442,6 +442,9 @@ with step4:
                 if st.button("Aplicar aceitação em lote", type="primary", disabled=elegiveis.empty):
                     output_df = st.session_state.output_df
                     audit_df_atualizado = st.session_state.audit_df.copy()
+                    for col in ("status", "decisao_automatica", "codigo_sugerido", "label_sugerido"):
+                        if col in audit_df_atualizado.columns:
+                            audit_df_atualizado[col] = audit_df_atualizado[col].astype(object)
                     for var in vars_escolhidas:
                         var_audit = audit_df_atualizado[audit_df_atualizado["variavel_controle"] == var]
                         mask = (
@@ -527,6 +530,9 @@ with step4:
                         if city_var not in output_df.columns:
                             st.error(f"A variável '{city_var}' não existe no banco processado.")
                         else:
+                            for col in ("status", "decisao_automatica", "codigo_sugerido", "label_sugerido"):
+                                if col in audit_df_atualizado.columns:
+                                    audit_df_atualizado[col] = audit_df_atualizado[col].astype(object)
                             id_series = df[st.session_state.id_column].astype(str)
                             realoc_ids = aplicaveis["ID"].astype(str)
                             code_by_id = dict(zip(realoc_ids, pd.to_numeric(aplicaveis["codigo_cidade_sugerido"])))

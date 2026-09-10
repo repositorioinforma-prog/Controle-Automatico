@@ -111,6 +111,16 @@ def apply_learned_lookup(
     result = audit_df.copy()
     label_by_code = {code: label for code, label in project_labels.items()}
 
+    # Força as colunas que vamos alterar linha a linha para dtype 'object'.
+    # Sem isso, se a coluna ficou com um dtype numérico estrito (ex.:
+    # float64) e o código aprendido do banco anterior é de um tipo um pouco
+    # diferente (ex.: numpy.int64 vs float, ou um código de VALUE LABELS em
+    # string), o pandas mais recente recusa a atribuição com TypeError em vez
+    # de converter silenciosamente.
+    for col in ("codigo_sugerido", "label_sugerido", "metodo", "status", "decisao_automatica"):
+        if col in result.columns:
+            result[col] = result[col].astype(object)
+
     mask = result["status"].isin(UNRESOLVED_STATUSES)
     for idx in result.index[mask]:
         key = normalize_text(result.at[idx, "texto_interpretado"])
